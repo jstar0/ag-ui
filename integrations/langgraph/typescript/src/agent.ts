@@ -996,7 +996,7 @@ export class LangGraphAgent extends AbstractAgent {
 
         if (currentSubgraph !== this.currentSubgraph) {
           this.currentSubgraph = currentSubgraph;
-          await this.getStateAndMessagesSnapshots(
+          latestStateValues = await this.getStateAndMessagesSnapshots(
             threadId,
             latestRootStateValues,
             hasOrderedRootStateValues,
@@ -1200,7 +1200,7 @@ export class LangGraphAgent extends AbstractAgent {
     threadId: string,
     orderedStateValues?: ThreadState<State>["values"],
     hasOrderedStateValues = false,
-  ): Promise<void> {
+  ): Promise<ThreadState<State>["values"]> {
     const state: ThreadState<State> = hasOrderedStateValues
       ? ({ values: orderedStateValues ?? {} } as ThreadState<State>)
       : await this.client.threads.getState(threadId);
@@ -1214,6 +1214,7 @@ export class LangGraphAgent extends AbstractAgent {
       type: EventType.MESSAGES_SNAPSHOT,
       messages: langchainMessagesToAgui(checkpointMessages),
     });
+    return state.values;
   }
 
   handleSingleEvent(event: any): void {
