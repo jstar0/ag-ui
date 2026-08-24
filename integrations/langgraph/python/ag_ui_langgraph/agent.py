@@ -772,7 +772,22 @@ class LangGraphAgent:
         in_window = bool(active_run.get("current_subagent_run_id"))
         state = active_run.setdefault(
             "hidden_suppressed",
-            {"messages": set(), "tool_calls": set(), "steps": {}},
+            {
+                "messages": set(), "tool_calls": set(), "steps": {},
+                # Ids the wire has SEEN as visible openers. Two jobs: a later
+                # visible opener RETIRES a suppressed id (upstream ids can be
+                # reused across turns/entities — permanence corrupted the new
+                # entity), and an in-window opener COLLIDING with a visible id
+                # must not poison the visible entity's followers (hidden runs
+                # without the attributed mode's collision-minting registry, so
+                # a subagent reusing the parent's `task` call id otherwise
+                # suppressed the parent's own TOOL_CALL_RESULT).
+                "visible_messages": set(), "visible_tool_calls": set(),
+                # Colliding ids: suppressed while the window is open (the
+                # collision's own followers), visible after it (the original
+                # entity's — the parent's task result arrives post-window).
+                "contested": set(),
+            },
         )
         etype = event.type
 
@@ -793,23 +808,37 @@ class LangGraphAgent:
 
         if etype in (EventType.TEXT_MESSAGE_START, EventType.REASONING_MESSAGE_START, EventType.REASONING_START):
             if in_window:
-                state["messages"].add(event.message_id)
+                if event.message_id in state["visible_messages"]:
+                    state["contested"].add(event.message_id)
+                else:
+                    state["messages"].add(event.message_id)
                 return True
+            state["visible_messages"].add(event.message_id)
+            state["messages"].discard(event.message_id)
+            state["contested"].discard(event.message_id)
             return False
         if etype in (
             EventType.TEXT_MESSAGE_CONTENT, EventType.TEXT_MESSAGE_END,
             EventType.REASONING_MESSAGE_CONTENT, EventType.REASONING_MESSAGE_END,
             EventType.REASONING_END,
         ):
-            return getattr(event, "message_id", None) in state["messages"]
+            message_id = getattr(event, "message_id", None)
+            if message_id in state["messages"]:
+                return True
+            return in_window and message_id in state["contested"]
         if etype in (EventType.TEXT_MESSAGE_CHUNK, EventType.REASONING_MESSAGE_CHUNK):
             message_id = getattr(event, "message_id", None)
             if message_id is not None:
                 if message_id in state["messages"]:
                     return True
                 if in_window:
-                    state["messages"].add(message_id)
+                    if message_id in state["visible_messages"]:
+                        state["contested"].add(message_id)
+                    else:
+                        state["messages"].add(message_id)
                     return True
+                state["visible_messages"].add(message_id)
+                state["contested"].discard(message_id)
                 return False
             # An id-less continuation chunk belongs to whatever is open in this
             # stream position; inside the window that is the subagent's stream.
@@ -817,19 +846,33 @@ class LangGraphAgent:
 
         if etype == EventType.TOOL_CALL_START:
             if in_window:
-                state["tool_calls"].add(event.tool_call_id)
+                if event.tool_call_id in state["visible_tool_calls"]:
+                    state["contested"].add(event.tool_call_id)
+                else:
+                    state["tool_calls"].add(event.tool_call_id)
                 return True
+            state["visible_tool_calls"].add(event.tool_call_id)
+            state["tool_calls"].discard(event.tool_call_id)
+            state["contested"].discard(event.tool_call_id)
             return False
         if etype in (EventType.TOOL_CALL_ARGS, EventType.TOOL_CALL_END, EventType.TOOL_CALL_RESULT):
-            return getattr(event, "tool_call_id", None) in state["tool_calls"]
+            tool_call_id = getattr(event, "tool_call_id", None)
+            if tool_call_id in state["tool_calls"]:
+                return True
+            return in_window and tool_call_id in state["contested"]
         if etype == EventType.TOOL_CALL_CHUNK:
             tool_call_id = getattr(event, "tool_call_id", None)
             if tool_call_id is not None:
                 if tool_call_id in state["tool_calls"]:
                     return True
                 if in_window:
-                    state["tool_calls"].add(tool_call_id)
+                    if tool_call_id in state["visible_tool_calls"]:
+                        state["contested"].add(tool_call_id)
+                    else:
+                        state["tool_calls"].add(tool_call_id)
                     return True
+                state["visible_tool_calls"].add(tool_call_id)
+                state["contested"].discard(tool_call_id)
                 return False
             return in_window
 
@@ -3207,15 +3250,19 @@ class LangGraphAgent:
                 resolved = self._dispatch_event(
                     ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=self.get_message_in_progress(self.active_run["id"])["tool_call_id"], raw_event=event)
                 )
-                if resolved:
-                    self.clear_message_in_progress(self.active_run["id"])
+                # Clear unconditionally: a None here means subagent_visibility="hidden"
+                # withheld the close from the wire, not that the model kept streaming.
+                # Leaving the slot open made the PARENT's next chunks read as a
+                # continuation of the suppressed entity — and vanish with it.
+                self.clear_message_in_progress(self.active_run["id"])
                 yield resolved
             elif self.get_message_in_progress(self.active_run["id"]) and self.get_message_in_progress(self.active_run["id"]).get("id"):
                 resolved = self._dispatch_event(
                     TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=self.get_message_in_progress(self.active_run["id"])["id"], raw_event=event)
                 )
-                if resolved:
-                    self.clear_message_in_progress(self.active_run["id"])
+                # Same rule as the tool-call branch above: the slot lifecycle is
+                # bookkeeping, not wire output — it must not depend on suppression.
+                self.clear_message_in_progress(self.active_run["id"])
                 yield resolved
 
         elif event_type == LangGraphEventTypes.OnCustomEvent:

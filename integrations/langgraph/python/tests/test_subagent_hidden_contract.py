@@ -250,6 +250,48 @@ class TestHiddenSuppressesTheSubagentStream(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(text, "hidden hides the SUBAGENT, not the parent")
 
 
+class TestHiddenDoesNotSwallowTheParent(unittest.IsolatedAsyncioTestCase):
+    """Review round 1, P1: the OnChatModelEnd branches cleared the shared
+    message-in-progress slot only when the close was EMITTED. Hidden withheld
+    the subagent's close, the slot stayed open, and the parent's entire
+    streamed reply was read as a continuation of the suppressed entity and
+    vanished — reproduced on a real DeepAgents graph. One combined drive, the
+    shape the earlier separate-drive tests missed."""
+
+    async def test_parent_text_flows_after_a_suppressed_subagent_message(self):
+        agent = _make_agent(subagent_visibility="hidden")
+        collected = [
+            e for e in await _drive(agent, [
+                # Subagent streams and CLOSES a message (close suppressed).
+                _chain_start("model", _sub_meta("s1", "model"), run_id="r1"),
+                _model_stream("r2", "from the subagent", _sub_meta("s1", "model")),
+                {
+                    "event": "on_chat_model_end",
+                    "run_id": "r2",
+                    "name": "model",
+                    "data": {},
+                    "metadata": _sub_meta("s1", "model"),
+                },
+                # Then the PARENT streams its reply.
+                _chain_start("model", _root_meta("model"), run_id="r3"),
+                _model_stream("r4", "the parent replying", _root_meta("model")),
+            ]) if e is not None
+        ]
+        parent_text = [
+            e for e in collected
+            if getattr(e, "type", None) == EventType.TEXT_MESSAGE_CONTENT
+        ]
+        self.assertTrue(
+            parent_text,
+            "the parent's streamed reply must survive a suppressed subagent close",
+        )
+        for ev in parent_text:
+            self.assertIsNone(getattr(ev, "subagent_run_id", None))
+        deltas = "".join(getattr(e, "delta", "") for e in parent_text)
+        self.assertIn("the parent replying", deltas)
+        self.assertNotIn("from the subagent", deltas)
+
+
 class TestHiddenPairing(unittest.TestCase):
     """Identity-paired suppression at the unit level: no unpaired opener or
     closer may ever reach the wire."""
@@ -392,3 +434,61 @@ class TestRunFiltersSuppressedEvents(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHiddenIdReuseAndCollision(unittest.TestCase):
+    """Review round 1, P2: suppressed identities were permanent, so upstream
+    id reuse corrupted later visible entities (hidden runs without attributed
+    mode's collision-minting registry)."""
+
+    def _agent(self):
+        agent = _make_agent(subagent_visibility="hidden")
+        agent.active_run = {"current_subagent_run_id": None}
+        return agent
+
+    def _window(self, agent, sid):
+        agent.active_run["current_subagent_run_id"] = sid
+
+    def test_a_visible_opener_retires_a_suppressed_message_id(self):
+        agent = self._agent()
+        self._window(agent, "s1")
+        self.assertIsNone(agent._dispatch_event(TextMessageStartEvent(
+            type=EventType.TEXT_MESSAGE_START, message_id="m1", role="assistant",
+        )))
+        self._window(agent, None)
+        # The parent (or a later turn) legally reuses the upstream id: the
+        # visible opener must retire the suppressed record, or the new
+        # message's content and end vanish and the wire carries a bare START.
+        self.assertIsNotNone(agent._dispatch_event(TextMessageStartEvent(
+            type=EventType.TEXT_MESSAGE_START, message_id="m1", role="assistant",
+        )))
+        self.assertIsNotNone(agent._dispatch_event(TextMessageContentEvent(
+            type=EventType.TEXT_MESSAGE_CONTENT, message_id="m1", delta="x",
+        )))
+        self.assertIsNotNone(agent._dispatch_event(TextMessageEndEvent(
+            type=EventType.TEXT_MESSAGE_END, message_id="m1",
+        )))
+
+    def test_a_subagent_colliding_with_the_parents_task_call_cannot_suppress_its_result(self):
+        agent = self._agent()
+        # The parent's own `task` call, visible.
+        self.assertIsNotNone(agent._dispatch_event(ToolCallStartEvent(
+            type=EventType.TOOL_CALL_START, tool_call_id="tc1", tool_call_name="task",
+        )))
+        self._window(agent, "s1")
+        # A subagent-internal tool reusing the SAME upstream id: its own events
+        # are suppressed while the window is open...
+        self.assertIsNone(agent._dispatch_event(ToolCallStartEvent(
+            type=EventType.TOOL_CALL_START, tool_call_id="tc1", tool_call_name="search",
+        )))
+        self.assertIsNone(agent._dispatch_event(ToolCallResultEvent(
+            type=EventType.TOOL_CALL_RESULT, message_id="tr-inner", tool_call_id="tc1",
+            content="internal",
+        )))
+        self._window(agent, None)
+        # ...but the parent's REQUIRED result, arriving after the window, must
+        # stay visible or the client aborts on an unanswered tool call.
+        self.assertIsNotNone(agent._dispatch_event(ToolCallResultEvent(
+            type=EventType.TOOL_CALL_RESULT, message_id="tr1", tool_call_id="tc1",
+            content="42",
+        )))
