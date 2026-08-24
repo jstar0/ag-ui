@@ -1671,13 +1671,16 @@ class LangGraphAgent:
                 # satisfy is_subgraph_stream, so leaving current_subgraph
                 # unadvanced alone never retried and the declared subgraph's
                 # snapshot stayed missing until run end.
-                deferred_sync = self.active_run.get("deferred_subgraph_sync")
+                # KEY PRESENCE is the debt marker, not the value: the owed
+                # target is legitimately None for a transition back to the ROOT
+                # graph (round 6: hotels_agent -> root stored None and the
+                # is-not-None flush never fired, leaving the h1 snapshot
+                # missing and current_subgraph stuck).
                 if (
-                    deferred_sync is not None
+                    "deferred_subgraph_sync" in self.active_run
                     and not self._raw_payload_is_subagent_side(self.active_run, event)
                 ):
-                    self.active_run["deferred_subgraph_sync"] = None
-                    self.current_subgraph = deferred_sync
+                    self.current_subgraph = self.active_run.pop("deferred_subgraph_sync")
                     async for ev in self.get_state_and_messages_snapshots(config):
                         yield ev
 
@@ -1695,7 +1698,7 @@ class LangGraphAgent:
                         self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
                         and self._raw_payload_is_subagent_side(self.active_run, event)
                     ):
-                        self.active_run["deferred_subgraph_sync"] = None
+                        self.active_run.pop("deferred_subgraph_sync", None)
                         self.current_subgraph = current_subgraph
                         async for ev in self.get_state_and_messages_snapshots(config):
                             yield ev
