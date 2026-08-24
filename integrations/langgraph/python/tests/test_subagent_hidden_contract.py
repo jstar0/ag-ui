@@ -529,8 +529,11 @@ class TestHiddenBoundaryAndStateLeaks(unittest.TestCase):
         self.assertIsNotNone(agent._dispatch_event(parent))
 
     def test_a_known_boundary_segment_suppresses_nested_raws(self):
+        # Round 3 caught the round-2 version of this test seeding a key
+        # production never writes (known_subagent_segments); reconcile
+        # populates "subagent_segments" — pin against the REAL key.
         agent = self._agent()
-        agent.active_run["known_subagent_segments"] = {"tools:abc"}
+        agent.active_run["subagent_segments"] = {"tools:abc"}
         nested = RawEvent(type=EventType.RAW, event={
             "event": "on_chain_end",
             "name": "researcher",
@@ -541,20 +544,38 @@ class TestHiddenBoundaryAndStateLeaks(unittest.TestCase):
         })
         self.assertIsNone(agent._dispatch_event(nested))
 
-    def test_state_is_suppressed_while_any_delegation_is_in_flight(self):
+    def test_parent_state_flows_during_a_delegation(self):
+        # Round 3 flipped the round-2 blanket: suppressing all state while any
+        # delegation was in flight starved a concurrent root tool's
+        # manually_emit_state and lost the parent's update PERMANENTLY. State
+        # suppression is provenance-based: window membership here, and the
+        # subagent-triggered transition snapshot is stopped at its trigger site
+        # in the stream loop (where the triggering event is in scope).
         agent = self._agent()
-        agent.active_run["active_subagents"] = {"tools:s1": {}, "tools:s2": {}}
-        # Mid-fan-out, the window can be None between lanes — the snapshot is a
-        # partial subgraph fragment either way.
-        snapshot = StateSnapshotEvent(
-            type=EventType.STATE_SNAPSHOT, snapshot={"leak": ["second"]},
-        )
-        self.assertIsNone(agent._dispatch_event(snapshot))
-        # Once every subagent closed, the parent's own state flows again.
-        agent.active_run["active_subagents"] = {}
+        agent.active_run["active_subagents"] = {"tools:s1": {}}
         self.assertIsNotNone(agent._dispatch_event(StateSnapshotEvent(
-            type=EventType.STATE_SNAPSHOT, snapshot={"parent": True},
+            type=EventType.STATE_SNAPSHOT, snapshot={"progress": "published while worker runs"},
+        )), "the parent's own state must survive a concurrent delegation")
+
+    def test_in_window_state_is_still_suppressed(self):
+        agent = self._agent()
+        agent.active_run["current_subagent_run_id"] = "tools:s1"
+        self.assertIsNone(agent._dispatch_event(StateSnapshotEvent(
+            type=EventType.STATE_SNAPSHOT, snapshot={"subagent": "internal"},
         )))
+
+    def test_a_parent_tools_raw_flows_during_a_delegation(self):
+        # The same round-3 starvation, RAW flavor: an ordinary root tool
+        # running alongside a slow task had its on_tool_end RAW suppressed
+        # while its on_tool_start stayed visible.
+        agent = self._agent()
+        agent.active_run["active_subagents"] = {"tools:s1": {}}
+        parent_raw = RawEvent(type=EventType.RAW, event={
+            "event": "on_tool_end",
+            "name": "publish_parent_state",
+            "metadata": {"langgraph_checkpoint_ns": "", "lc_agent_name": None},
+        })
+        self.assertIsNotNone(agent._dispatch_event(parent_raw))
 
 
 class TestHiddenLaneScopedStreamMembership(unittest.TestCase):

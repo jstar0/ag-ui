@@ -901,17 +901,19 @@ class LangGraphAgent:
                 return True
             return in_window
 
-        # State and RAW leak through gaps the window cannot see: mid-fan-out
-        # snapshots carry partial subgraph fragments that would REPLACE the
-        # parent's state on the client, and DeepAgents' boundary chain events
-        # arrive under a bare `tools:<uuid>` namespace (no `|`) before any lane
-        # exists. Both are subagent internals under hidden's contract, so they
-        # are suppressed while a delegation is in flight at all — the parent's
-        # own state resumes flowing once every subagent closed.
+        # State and RAW leak through gaps the window cannot see: DeepAgents'
+        # boundary chain events arrive under a bare `tools:<uuid>` namespace
+        # (no `|`) before any lane exists, and post-close boundary events
+        # trail after it. Suppression stays PROVENANCE-based — an earlier
+        # delegation-in-flight blanket starved a concurrent root tool's RAW
+        # and the parent's own manually_emit_state, losing a legitimate parent
+        # state update permanently. Subagent-derived transition snapshots are
+        # stopped at their trigger site instead (the stream loop knows the
+        # triggering event), so window membership is all STATE needs here.
         if etype in (EventType.STATE_SNAPSHOT, EventType.STATE_DELTA):
-            return in_window or bool(active_run.get("active_subagents"))
+            return in_window
         if etype == EventType.RAW:
-            if in_window or bool(active_run.get("active_subagents")):
+            if in_window:
                 return True
             return self._raw_payload_is_subagent_side(active_run, getattr(event, "event", None))
 
@@ -937,7 +939,7 @@ class LangGraphAgent:
         if not ns:
             return False
         segments = ns.split("|")
-        known = active_run.get("known_subagent_segments") or set()
+        known = active_run.get("subagent_segments") or set()
         if any(segment in known for segment in segments):
             return True
         leading = segments[0]
@@ -1666,8 +1668,16 @@ class LangGraphAgent:
                 if is_subgraph_stream and current_subgraph != self.current_subgraph:
                     self.current_subgraph = current_subgraph
                     # Every time a subgraph changes, we need to update the state and messages snapshots.
-                    async for ev in self.get_state_and_messages_snapshots(config):
-                        yield ev
+                    # Under hidden, a transition TRIGGERED by a subagent-side event
+                    # snapshots a partial subgraph fragment that would replace the
+                    # parent's state on the client — that provenance is only visible
+                    # here, where the triggering upstream event is in scope.
+                    if not (
+                        self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
+                        and self._raw_payload_is_subagent_side(self.active_run, event)
+                    ):
+                        async for ev in self.get_state_and_messages_snapshots(config):
+                            yield ev
 
                 # Record each `task` ToolNode dispatch (its on_chain_start
                 # precedes the task's on_tool_start) so the subagent can be
