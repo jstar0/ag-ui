@@ -226,6 +226,26 @@ def derive_subagent_context(
 # the protocol design; this integration emits them for a subagent only on the
 # explicit `manually_emit_state` path, since node-exit and checkpoint snapshots
 # would carry a partial subgraph view (see the suppressions in the stream loop).
+# The three client-facing presentations of a delegation. Values name what the
+# CLIENT SEES, not internal switches:
+#   "inline"     - the subagent's output streams as the parent's own work,
+#                  byte-identical to pre-subagent behavior (the safe default:
+#                  a released client cannot be protected after the fact from
+#                  event types it rejects in its transport).
+#   "attributed" - the full subagent surface: SUBAGENT_* lifecycle events,
+#                  subagent_run_id tags, merged snapshot messages.
+#   "hidden"     - invisible delegation: the client sees only the parent's
+#                  `task` tool call, its TOOL_CALL_RESULT, and the parent's own
+#                  reply. Nothing of the subagent's internals reaches the wire.
+SUBAGENT_VISIBILITY_INLINE = "inline"
+SUBAGENT_VISIBILITY_ATTRIBUTED = "attributed"
+SUBAGENT_VISIBILITY_HIDDEN = "hidden"
+_SUBAGENT_VISIBILITY_VALUES = (
+    SUBAGENT_VISIBILITY_INLINE,
+    SUBAGENT_VISIBILITY_ATTRIBUTED,
+    SUBAGENT_VISIBILITY_HIDDEN,
+)
+
 _SUBAGENT_ATTRIBUTABLE_EVENT_TYPES = frozenset({
     EventType.TEXT_MESSAGE_START, EventType.TEXT_MESSAGE_CHUNK,
     EventType.TEXT_MESSAGE_CONTENT, EventType.TEXT_MESSAGE_END,
@@ -581,7 +601,7 @@ class PreparedStream(TypedDict):
     events_to_dispatch: NotRequired[Optional[List[ProcessedEvents]]]
 
 class LangGraphAgent:
-    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None, enable_legacy_on_interrupt_event: bool = True, emit_interrupt_outcome: bool = False, emit_raw_events: bool = True, emit_subagent_events: bool = False):
+    def __init__(self, *, name: str, graph: CompiledStateGraph, description: Optional[str] = None, config:  Union[Optional[RunnableConfig], dict] = None, enable_legacy_on_interrupt_event: bool = True, emit_interrupt_outcome: bool = False, emit_raw_events: bool = True, emit_subagent_events: Optional[bool] = None, subagent_visibility: Optional[str] = None):
         self.name = name
         self.description = description
         self.graph = graph
@@ -622,7 +642,35 @@ class LangGraphAgent:
         #
         # Flip the default once a released client understands the events. Requested this
         # way by a design partner whose package proxy refuses prerelease builds.
-        self.emit_subagent_events = emit_subagent_events
+        #
+        # subagent_visibility supersedes the boolean: "inline" (the default,
+        # exactly the False behavior above), "attributed" (the True behavior),
+        # and "hidden" (invisible delegation: the subagent's internal stream is
+        # suppressed entirely — the client sees only the parent's `task` call,
+        # its result, and the parent's own reply; see _dispatch_event). The
+        # boolean stays as an alias for one cycle (True -> "attributed",
+        # False -> "inline") because the design partner's harness already sets
+        # it; passing both with conflicting meanings is an error.
+        if subagent_visibility is not None and subagent_visibility not in _SUBAGENT_VISIBILITY_VALUES:
+            raise ValueError(
+                f"subagent_visibility must be one of {_SUBAGENT_VISIBILITY_VALUES}, got {subagent_visibility!r}"
+            )
+        if emit_subagent_events is not None:
+            alias_visibility = (
+                SUBAGENT_VISIBILITY_ATTRIBUTED if emit_subagent_events else SUBAGENT_VISIBILITY_INLINE
+            )
+            if subagent_visibility is not None and subagent_visibility != alias_visibility:
+                raise ValueError(
+                    f"emit_subagent_events={emit_subagent_events} conflicts with "
+                    f"subagent_visibility={subagent_visibility!r}; pass only subagent_visibility"
+                )
+            subagent_visibility = alias_visibility
+        self.subagent_visibility = subagent_visibility or SUBAGENT_VISIBILITY_INLINE
+        # Derived: every existing subagent gate keys on this boolean, and only
+        # "attributed" emits the subagent surface. "hidden" deliberately reads
+        # as False here — it shares inline's teardown paths and adds
+        # suppression at the _dispatch_event chokepoint.
+        self.emit_subagent_events = self.subagent_visibility == SUBAGENT_VISIBILITY_ATTRIBUTED
         self.messages_in_process: MessagesInProgressRecord = {}
         self.active_run: Optional[RunMetadata] = None
         self.constant_schema_keys = ['messages', 'tools']
@@ -653,8 +701,15 @@ class LangGraphAgent:
                 emit_raw_events=self.emit_raw_events,
                 # Every constructor flag must survive a clone: the FastAPI endpoint
                 # clones per request, so a flag dropped here silently reverts to its
-                # default in the standard serving path.
-                emit_subagent_events=self.emit_subagent_events,
+                # default in the standard serving path. Inline/attributed travel as
+                # the boolean alias so existing subclasses whose __init__ predates
+                # subagent_visibility keep cloning; only "hidden" needs the new
+                # kwarg (a subclass opting into it must accept it).
+                **(
+                    {"subagent_visibility": self.subagent_visibility}
+                    if self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
+                    else {"emit_subagent_events": self.emit_subagent_events}
+                ),
             )
         except TypeError as exc:
             raise TypeError(
@@ -675,6 +730,20 @@ class LangGraphAgent:
                 event.raw_event = None
 
         active_run = getattr(self, "active_run", None)
+
+        # "hidden": invisible delegation. Suppression is IDENTITY-PAIRED, not
+        # purely window-based, because entities straddle the window boundary:
+        # the parent's `tools` step opens before the subagent's first event and
+        # its close can land inside the window (the node transition that closes
+        # it is often triggered by the subagent's own first event). A naive
+        # window filter would orphan that close on the wire. So: window
+        # membership decides whether an OPENER is suppressed; every follower is
+        # then suppressed iff its opener was, by id — and a follower of a
+        # visible pre-window opener stays visible even mid-window.
+        if self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN and active_run is not None:
+            if self._hidden_should_suppress(active_run, event):
+                return None
+
         current_subagent_run_id = (
             active_run.get("current_subagent_run_id")
             if active_run and self.emit_subagent_events
@@ -690,6 +759,94 @@ class LangGraphAgent:
         self._accumulate_subagent_message(event)
 
         return event
+
+    def _hidden_should_suppress(self, active_run, event: ProcessedEvents) -> bool:
+        """Decide whether `subagent_visibility="hidden"` withholds this event.
+
+        The wire must stay pairwise-coherent: no STEP_FINISHED without its
+        STEP_STARTED, no TEXT_MESSAGE_CONTENT without its START. Openers are
+        suppressed when they occur inside a subagent window
+        (current_subagent_run_id set); followers and closers inherit their
+        opener's fate by id, regardless of where the window is by then.
+        """
+        in_window = bool(active_run.get("current_subagent_run_id"))
+        state = active_run.setdefault(
+            "hidden_suppressed",
+            {"messages": set(), "tool_calls": set(), "steps": {}},
+        )
+        etype = event.type
+
+        if etype == EventType.STEP_STARTED:
+            if in_window:
+                steps = state["steps"]
+                steps[event.step_name] = steps.get(event.step_name, 0) + 1
+                return True
+            return False
+        if etype == EventType.STEP_FINISHED:
+            steps = state["steps"]
+            if steps.get(event.step_name, 0) > 0:
+                steps[event.step_name] -= 1
+                return True
+            # Closes a step whose open was emitted (e.g. the parent's `tools`
+            # step closing mid-window) — must stay visible.
+            return False
+
+        if etype in (EventType.TEXT_MESSAGE_START, EventType.REASONING_MESSAGE_START, EventType.REASONING_START):
+            if in_window:
+                state["messages"].add(event.message_id)
+                return True
+            return False
+        if etype in (
+            EventType.TEXT_MESSAGE_CONTENT, EventType.TEXT_MESSAGE_END,
+            EventType.REASONING_MESSAGE_CONTENT, EventType.REASONING_MESSAGE_END,
+            EventType.REASONING_END,
+        ):
+            return getattr(event, "message_id", None) in state["messages"]
+        if etype in (EventType.TEXT_MESSAGE_CHUNK, EventType.REASONING_MESSAGE_CHUNK):
+            message_id = getattr(event, "message_id", None)
+            if message_id is not None:
+                if message_id in state["messages"]:
+                    return True
+                if in_window:
+                    state["messages"].add(message_id)
+                    return True
+                return False
+            # An id-less continuation chunk belongs to whatever is open in this
+            # stream position; inside the window that is the subagent's stream.
+            return in_window
+
+        if etype == EventType.TOOL_CALL_START:
+            if in_window:
+                state["tool_calls"].add(event.tool_call_id)
+                return True
+            return False
+        if etype in (EventType.TOOL_CALL_ARGS, EventType.TOOL_CALL_END, EventType.TOOL_CALL_RESULT):
+            return getattr(event, "tool_call_id", None) in state["tool_calls"]
+        if etype == EventType.TOOL_CALL_CHUNK:
+            tool_call_id = getattr(event, "tool_call_id", None)
+            if tool_call_id is not None:
+                if tool_call_id in state["tool_calls"]:
+                    return True
+                if in_window:
+                    state["tool_calls"].add(tool_call_id)
+                    return True
+                return False
+            return in_window
+
+        if etype == EventType.REASONING_ENCRYPTED_VALUE:
+            entity_id = getattr(event, "entity_id", None)
+            if entity_id is not None and (
+                entity_id in state["messages"] or entity_id in state["tool_calls"]
+            ):
+                return True
+            return in_window
+
+        # Windowless pairing does not apply to the rest of the attributable
+        # surface (state/activity/custom/raw): those are point events, dropped
+        # purely by window membership.
+        if etype in _SUBAGENT_ATTRIBUTABLE_EVENT_TYPES:
+            return in_window
+        return False
 
     def _capture_task_tool_dispatch(self, event: dict) -> None:
         """Map each `task` ToolNode dispatch to its originating tool_call_id.
@@ -1256,7 +1413,10 @@ class LangGraphAgent:
             update["messages"] = graph_messages
 
         async for event_str in self._handle_stream_events(input.model_copy(update=update)):
-            yield event_str
+            # _dispatch_event returns None for events `subagent_visibility="hidden"`
+            # withholds; this is the one place every emission funnels through.
+            if event_str is not None:
+                yield event_str
 
     async def _handle_stream_events(self, input: RunAgentInput) -> AsyncGenerator[ProcessedEvents, None]:
         thread_id = input.thread_id or str(uuid.uuid4())
@@ -3776,6 +3936,11 @@ class LangGraphAgent:
                 step_name=node_name
             )
         )
+        if event is None:
+            # Suppressed by subagent_visibility="hidden": the step bookkeeping
+            # below already ran for the open half; just tidy and emit nothing.
+            self.active_run.get("step_owners", {}).pop(lane, None)
+            return None
         # Overwrite whatever the chokepoint stamped. In the stream loop
         # reconcile_subagents runs BEFORE handle_node_change, so current_subagent_run_id
         # already points at the lane whose event triggered the transition, not the
