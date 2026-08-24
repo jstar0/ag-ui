@@ -1080,26 +1080,6 @@ export const defaultApplyEvents = (
           throw new Error("TOOL_CALL_CHUNK must be tranformed before being applied");
         }
 
-        case EventType.THINKING_START: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_END: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_TEXT_MESSAGE_START: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_TEXT_MESSAGE_CONTENT: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_TEXT_MESSAGE_END: {
-          return emitUpdates();
-        }
-
         case EventType.REASONING_START: {
           const mutation = await runSubscribersWithMutation(
             subscribers,
@@ -1311,6 +1291,14 @@ export const defaultApplyEvents = (
               currentMutation.messages = messages;
             }
           }
+          return emitUpdates();
+        }
+
+        case EventType.SUBAGENT_STARTED:
+        case EventType.SUBAGENT_FINISHED:
+        case EventType.SUBAGENT_ERROR: {
+          // Subagent lifecycle events carry attribution, not client state;
+          // nothing to apply until the multi-agent state model lands.
           return emitUpdates();
         }
       }

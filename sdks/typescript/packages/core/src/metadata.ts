@@ -1,4 +1,5 @@
-import { z } from "zod";
+import { MetadataSchema } from "./generated/schemas";
+import type { Metadata } from "./generated/types";
 
 /**
  * The key reserved for AG-UI's own use inside a metadata object. Every other
@@ -24,32 +25,23 @@ export const AGUI_METADATA_KEY = "ag-ui";
  * every value on every event, on the streaming hot path, to catch a mistake
  * (a function, a bigint) that already fails loudly at encode time.
  *
- * One consequence worth knowing: `z.record` drops an own `__proto__` key, which
- * is its prototype-pollution guard. Preserving it would need null-prototype
- * objects throughout parsing and protobuf conversion, handing every consumer
- * objects where `hasOwnProperty` throws — a real cost for a key that is
- * essentially only ever an attack probe. Python keeps it; TypeScript does not.
+ * The schema itself now lives in the generated source (MetadataSchema in
+ * src/generated/schemas.ts); this comment survives as the recorded reasoning.
  */
-export const MetadataSchema = z.record(z.any());
-
-export type Metadata = z.infer<typeof MetadataSchema>;
-
 /**
- * How metadata is declared on events and messages.
+ * A tolerant metadata reader: accepts an explicit `null` and coerces it to
+ * absent.
  *
- * The object itself is absent or an object, never `null` — that is the
- * invariant a producer must uphold, and it always holds after parsing.
+ * NOT what the protocol validators do. Since the SDK moved onto the generated
+ * schemas (PNI-212), an event or message carrying `metadata: null` REJECTS —
+ * the schema pins that metadata is absent or an object, never null. This
+ * helper survives as a boundary utility for code that meets legacy producers
+ * before validation (Pydantic's plain `model_dump()` emits null for an unset
+ * object); the middleware that owns those tolerances lands with PNI-207.
  *
- * Parsing is deliberately more forgiving than that invariant: an explicit
- * `null` is accepted and coerced to absent. Pydantic models serialized with a
- * plain `model_dump()` — no `exclude_none=True` — emit `"metadata": null` for
- * an unset object, and rejecting that would make the Python SDK fail to parse
- * its own output. This is the same treatment `parentMessageId` and `outcome`
- * already receive in `events.ts`, for exactly the same reason.
- *
- * Note the asymmetry, which is intentional: a `null` *value under a key* is
- * meaningful data and is preserved. Only a `null` in place of the whole object
- * is treated as absent.
+ * The asymmetry is intentional either way: a `null` *value under a key* is
+ * meaningful data and is preserved. Only a `null` in place of the whole
+ * object is coerced.
  */
 export const OptionalMetadataSchema = MetadataSchema.nullable()
   .optional()

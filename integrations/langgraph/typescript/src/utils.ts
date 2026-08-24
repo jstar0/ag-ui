@@ -117,8 +117,23 @@ function convertLangchainMultimodalToAgui(
  * for backwards compatibility. All media types are routed through LangChain's
  * `image_url` format since that is the only media block type LangChain supports.
  */
+/**
+ * The legacy binary content part, which left `@ag-ui/core` in 1.0 (the
+ * 0.0.47 client middleware converts it on modern pipelines). Old producers
+ * still send it straight to servers, so this boundary keeps reading it —
+ * typed locally, because the protocol no longer knows the shape.
+ */
+interface LegacyBinaryInputContent {
+  type: "binary";
+  mimeType: string;
+  id?: string;
+  url?: string;
+  data?: string;
+  filename?: string;
+}
+
 function convertAguiMultimodalToLangchain(
-  content: InputContent[]
+  content: Array<InputContent | LegacyBinaryInputContent>
 ): Array<{ type: string; text?: string; image_url?: { url: string } }> {
   const langchainContent: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
 

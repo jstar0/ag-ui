@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InterruptSchema, ResumeEntrySchema, RunAgentInputSchema } from "../types";
+import { InterruptSchema, ResumeEntrySchema, RunAgentInputSchema } from "../index";
 
 describe("InterruptSchema", () => {
   it("accepts an interrupt with only required fields", () => {
@@ -97,13 +97,14 @@ describe("ResumeEntry.metadata", () => {
     expect(parsed.metadata).toBeUndefined();
   });
 
-  it("reads an explicit null as absent", () => {
-    const parsed = ResumeEntrySchema.parse({
-      interruptId: "int-1",
+  it("rejects an explicit null", () => {
+    // The schema pins this: metadata is absent or an object, never null.
+    const result = ResumeEntrySchema.safeParse({
+      interruptId: "i-1",
       status: "resolved",
       metadata: null,
     });
-    expect(parsed.metadata).toBeUndefined();
+    expect(result.success).toBe(false);
   });
 
   it("serializes without the key when absent, rather than emitting null", () => {

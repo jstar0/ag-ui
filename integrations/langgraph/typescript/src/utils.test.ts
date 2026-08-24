@@ -7,13 +7,24 @@ import {
   Message,
   UserMessage,
   TextInputContent,
-  BinaryInputContent,
+  InputContent,
   ImageInputContent,
   AudioInputContent,
   VideoInputContent,
   DocumentInputContent,
 } from "@ag-ui/client";
 import { aguiMessagesToLangChain, langchainMessagesToAgui, resolveReasoningContent } from "./utils";
+
+// The legacy binary part left @ag-ui/core in 1.0; this boundary still reads
+// it (see utils.ts), so the tests type it locally.
+interface BinaryInputContent {
+  type: "binary";
+  mimeType: string;
+  id?: string;
+  url?: string;
+  data?: string;
+  filename?: string;
+}
 
 describe("Multimodal Message Conversion", () => {
   describe("aguiMessagesToLangChain", () => {
@@ -181,7 +192,7 @@ describe("Multimodal Message Conversion", () => {
             type: "binary",
             mimeType: "image/jpeg",
             url: "https://example.com/photo.jpg",
-          } as BinaryInputContent,
+          } as BinaryInputContent as unknown as InputContent,
         ],
       };
 
@@ -203,7 +214,7 @@ describe("Multimodal Message Conversion", () => {
             type: "binary",
             mimeType: "image/png",
             data: "iVBORw0KGgoAAAANSUhEUgAAAAUA",
-          } as BinaryInputContent,
+          } as BinaryInputContent as unknown as InputContent,
         ],
       };
 
@@ -324,7 +335,7 @@ describe("Multimodal Message Conversion", () => {
             type: "binary",
             mimeType: "image/jpeg",
             id: "img-123",
-          } as BinaryInputContent,
+          } as BinaryInputContent as unknown as InputContent,
         ],
       };
 
@@ -366,7 +377,7 @@ describe("Multimodal Message Conversion", () => {
             type: "binary",
             mimeType: "image/jpeg",
             // No url, data, or id
-          } as BinaryInputContent,
+          } as BinaryInputContent as unknown as InputContent,
         ],
       };
 

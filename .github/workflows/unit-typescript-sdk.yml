@@ -108,3 +108,10 @@ jobs:
 
       - name: Run tests
         run: pnpm run test
+
+      # @ag-ui/core declares zod ^3.25.76 but all its runtime code uses the
+      # zod/v4 subpath API, which both supported majors ship. The matrix packs
+      # the built package and consumes it under zod 3 and zod 4, through
+      # require() and import, so an API drift on either major fails here.
+      - name: Verify both zod majors (both module formats)
+        run: node sdks/typescript/packages/core/scripts/verify-zod-matrix.mjs

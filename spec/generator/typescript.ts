@@ -102,7 +102,13 @@ function fieldTags(field: Field): string[] {
   return tags;
 }
 
-function emitInterface(definition: ObjectDefinition): string {
+// Object shapes are emitted as type aliases, not interfaces, deliberately:
+// an object-literal type gets an implicit index signature, so a concrete
+// event stays assignable to open shapes like the SDK's historic BaseEvent
+// (base fields plus `[key: string]: unknown`), exactly as zod-inferred alias
+// types always were. An interface never satisfies an index signature, and
+// nothing generated should be augmentable by declaration merging anyway.
+function emitObjectType(definition: ObjectDefinition): string {
   const fields = definition.fields
     .map((field) => {
       const description =
@@ -114,13 +120,13 @@ function emitInterface(definition: ObjectDefinition): string {
       return `${doc}\n  ${field.name}${optional}: ${tsType(field.type)};`;
     })
     .join("\n");
-  return `${jsdoc(definition.description)}\nexport interface ${definition.name} {\n${fields}\n}`;
+  return `${jsdoc(definition.description)}\nexport type ${definition.name} = {\n${fields}\n};`;
 }
 
 function emitTypeDefinition(definition: Definition): string {
   switch (definition.kind) {
     case "object":
-      return emitInterface(definition);
+      return emitObjectType(definition);
     case "union":
       return `${jsdoc(definition.description)}\nexport type ${definition.name} =\n${definition.members
         .map((member) => `  | ${member}`)
@@ -141,9 +147,15 @@ function emitTypeDefinition(definition: Definition): string {
 }
 
 export function emitTypes(model: ProtocolModel): string {
-  return [banner(model), ...model.definitions.map(emitTypeDefinition), ""].join(
-    "\n\n",
-  );
+  // The mixin shapes come last: every event and message flattens them in, but
+  // consumers also need the shared shapes themselves (BaseEvent is the "fields
+  // every event carries" type the SDKs are written against).
+  return [
+    banner(model),
+    ...model.definitions.map(emitTypeDefinition),
+    ...model.mixinShapes.map(emitTypeDefinition),
+    "",
+  ].join("\n\n");
 }
 
 /** Renders a TypeExpr as a zod v4 expression. */
@@ -275,6 +287,10 @@ export function emitSchemas(model: ProtocolModel): string {
     ...model.definitions.map((definition) =>
       emitSchemaDefinition(definition, anyAliases),
     ),
+    // The mixin shapes, emitted last so everything they reference exists.
+    ...model.mixinShapes.map((definition) =>
+      emitSchemaDefinition(definition, anyAliases),
+    ),
     "",
   ].join("\n\n");
 }
@@ -290,60 +306,6 @@ export function emitVersion(model: ProtocolModel): string {
   ].join("\n\n");
 }
 
-export function emitAgreement(model: ProtocolModel): string {
-  const preamble = `import type { z } from "zod/v4";
-import type * as t from "./types";
-import type * as s from "./schemas";
-
-/**
- * Type-level agreement between the interfaces and the zod schemas: the two are
- * emitted independently, so a generator bug that makes one field optional in
- * one and required in the other would otherwise ship silently. Each assertion
- * compares the schema's inferred output with the interface, after stripping
- * looseObject's own index signature (its value is exactly unknown) while
- * keeping the open-by-key positions' index signatures (their value is any),
- * so records stay compared and only the passthrough artefact is ignored. A
- * mismatch is a compile error on every build of this package.
- */
-type IsAny<T> = 0 extends 1 & T ? true : false;
-type DeepClean<T> =
-  IsAny<T> extends true
-    ? T
-    : T extends readonly (infer U)[]
-      ? DeepClean<U>[]
-      : T extends object
-        ? {
-            [K in keyof T as string extends K
-              ? unknown extends T[K]
-                ? IsAny<T[K]> extends true
-                  ? K
-                  : never
-                : K
-              : K]: DeepClean<T[K]>;
-          }
-        : T;
-type Equal<A, B> =
-  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
-    ? true
-    : false;
-type Expect<T extends true> = T;`;
-
-  const checks = model.definitions
-    .map((definition) => {
-      // A TS enum type and the union of its member types are the same values
-      // but distinct to TypeScript's type identity, so the enum's check
-      // compares against the member union rather than the enum type name.
-      const expected =
-        definition.kind === "enum" && definition.name === TS_ENUM
-          ? `(typeof t.${TS_ENUM})[keyof typeof t.${TS_ENUM}]`
-          : `DeepClean<t.${definition.name}>`;
-      return `type _${definition.name} = Expect<Equal<DeepClean<z.infer<typeof s.${definition.name}Schema>>, ${expected}>>;`;
-    })
-    .join("\n");
-
-  return [banner(model), preamble, checks, "export {};", ""].join("\n\n");
-}
-
 export interface GeneratedFile {
   name: string;
   content: string;
@@ -354,6 +316,5 @@ export function emitTypeScript(model: ProtocolModel): GeneratedFile[] {
     { name: "types.ts", content: emitTypes(model) },
     { name: "schemas.ts", content: emitSchemas(model) },
     { name: "version.ts", content: emitVersion(model) },
-    { name: "agreement.ts", content: emitAgreement(model) },
   ];
 }

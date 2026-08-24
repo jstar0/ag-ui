@@ -52,18 +52,11 @@ for (const anchor of readdirSync(FIXTURES_DIR).sort()) {
 }
 
 /**
- * Schema-valid documents the handwritten models reject (a required-ness
- * divergence RECONCILIATION.md records: handwritten RunAgentInput requires
- * tools and context). The binary transport cannot tell an absent array from
- * an empty one, so decode materialises the input arrays as present-and-empty
- * — the one form every layer accepts. The JSON path still rejects the raw
- * document; over binary the stream normalises and validates.
- *
- * A further recorded divergence, invisible to these assertions: the
- * handwritten schemas strip subagentRunId from nested interrupts and messages
- * (it lands with #2350), so the JSON path and the binary path both lose it
- * today even though the wire carries Interrupt field 8 and Message field 10.
- * The byte fixtures therefore do not exercise those slots yet.
+ * Recorded wire normalisations: the binary transport cannot tell an absent
+ * repeated field from an empty one, so decode materialises the optional
+ * RunAgentInput arrays as present-and-empty — the one form every layer
+ * accepts. (The old requiredness divergence is gone: the generated
+ * RunAgentInput makes tools and context optional, as the schema always did.)
  */
 const BINARY_NORMALISED: Record<
   string,
@@ -102,9 +95,7 @@ describe("every valid event fixture round-trips over the binary transport", () =
   it("covers all 31 event types", () => {
     // A deleted fixture directory must not silently shrink the corpus.
     const covered = new Set(cases.map((entry) => entry.document.type));
-    const declared = Object.values(EventType).filter(
-      (value) => !String(value).startsWith("THINKING"),
-    );
+    const declared = Object.values(EventType);
     expect(declared.filter((value) => !covered.has(value))).toEqual([]);
     expect(covered.size).toBe(31);
   });
@@ -112,8 +103,7 @@ describe("every valid event fixture round-trips over the binary transport", () =
   it.each(cases.map((entry) => [entry.name, entry] as const))("%s", (name, entry) => {
     const normalise = BINARY_NORMALISED[name];
     if (normalise) {
-      expect(() => materialise(entry.document)).toThrow();
-      const decoded = decode(encode(entry.document as never));
+      const decoded = decode(encode(materialise(entry.document) as never));
       expect(decoded).toEqual(normalise(entry.document));
       expectNoUndefinedKeys(decoded);
       return;
@@ -139,7 +129,7 @@ describe("byte fixtures", () => {
     "%s matches its committed bytes",
     (name, entry) => {
       const normalise = BINARY_NORMALISED[name];
-      const encodeInput = normalise ? entry.document : materialise(entry.document);
+      const encodeInput = materialise(entry.document);
       const expected = normalise ? normalise(entry.document) : encodeInput;
       const bytes = encode(encodeInput as never);
       const path = join(BYTES_DIR, `${entry.name.replace(/[/]/g, "__")}.bin`);
@@ -179,15 +169,28 @@ describe(".NET byte fixtures", () => {
   );
 
   /**
-   * Recorded .NET-model collapses: a root-level null in an optional any-typed
+   * Recorded .NET-model collapses. A root-level null in an optional any-typed
    * field deserialises to C# null and is never written back, so the .NET
-   * bytes legitimately lack it. Nulls nested inside any-typed values survive.
+   * bytes legitimately lack it (nulls nested inside any-typed values
+   * survive). And the .NET message/interrupt models have no subagentRunId
+   * property until #2350, so nested attribution does not cross from that
+   * side — wire slots Message.10 and Interrupt.8 stay empty in .NET bytes.
    */
+  const stripNestedSubagentRunId = (expected: Record<string, unknown>): unknown =>
+    JSON.parse(
+      JSON.stringify(expected, (key, value: unknown) =>
+        key === "subagentRunId" ? undefined : value,
+      ),
+    ) as unknown;
+
   const DOTNET_NORMALISED: Record<
     string,
     ((expected: Record<string, unknown>) => unknown) | undefined
   > = {
     "TextMessageEndEvent/raw-event-null.json": ({ rawEvent: _rawEvent, ...rest }) => rest,
+    "MessagesSnapshotEvent/attributed-messages.json": stripNestedSubagentRunId,
+    "RunFinishedEvent/outcome-interrupt.json": stripNestedSubagentRunId,
+    "RunFinishedEvent/outcome-interrupt-full.json": stripNestedSubagentRunId,
   };
 
   const dotnetCases = cases.filter((entry) => !entry.name.startsWith("Subagent"));

@@ -144,11 +144,9 @@ export const transformChunks =
           case EventType.RUN_ERROR:
           case EventType.STEP_STARTED:
           case EventType.STEP_FINISHED:
-          case EventType.THINKING_START:
-          case EventType.THINKING_END:
-          case EventType.THINKING_TEXT_MESSAGE_START:
-          case EventType.THINKING_TEXT_MESSAGE_CONTENT:
-          case EventType.THINKING_TEXT_MESSAGE_END:
+          case EventType.SUBAGENT_STARTED:
+          case EventType.SUBAGENT_FINISHED:
+          case EventType.SUBAGENT_ERROR:
           case EventType.REASONING_START:
           case EventType.REASONING_MESSAGE_START:
           case EventType.REASONING_MESSAGE_CONTENT:
@@ -378,8 +376,12 @@ export const transformChunks =
             return reasoningMessageResult;
           }
         }
+        // Unknown to this enum — a legacy type a compat middleware still
+        // translates, or a future one. Not this stage's to judge: chunk
+        // transformation passes it through untouched and downstream layers
+        // decide. Dropping it here would starve the middlewares.
         const _exhaustiveCheck: never = event.type;
-        return [];
+        return [...closePendingEvent(), event];
       }),
       finalize(() => {
         // This ensures that we close any pending events when the source observable completes

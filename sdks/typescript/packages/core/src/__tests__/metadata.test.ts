@@ -41,9 +41,10 @@ describe("MetadataSchema", () => {
   });
 
   it("reads an explicit null as absent, and preserves null values under keys", () => {
-    // Producers must not emit a null object, but Pydantic models serialized
-    // without exclude_none=True do, so parsing tolerates it. A null *value*
-    // under a key is data and survives.
+    // Deliberately NOT the protocol validators' behaviour (those reject a
+    // null metadata object, pinned below): this helper is the tolerant
+    // boundary reader for legacy producers, retained for the PNI-207
+    // middleware. A null *value* under a key is data and survives.
     expect(OptionalMetadataSchema.parse(undefined)).toBeUndefined();
     expect(OptionalMetadataSchema.parse(null)).toBeUndefined();
     expect(OptionalMetadataSchema.parse({ a: null })).toEqual({ a: null });
@@ -67,13 +68,16 @@ describe("metadata on events", () => {
     expect(parsed.metadata).toBeUndefined();
   });
 
-  it("reads an explicit null on an event as absent", () => {
-    const parsed = TextMessageStartEventSchema.parse({
+  it("rejects an explicit null on an event", () => {
+    // The schema pins this: metadata is absent or an object, never null.
+    // Python's own encoder serializes with exclude_none=True, so the official
+    // path never emits one; a producer bypassing it fails loudly here.
+    const result = TextMessageStartEventSchema.safeParse({
       type: EventType.TEXT_MESSAGE_START,
       messageId: "m1",
       metadata: null,
     });
-    expect(parsed.metadata).toBeUndefined();
+    expect(result.success).toBe(false);
   });
 
   it("round-trips through JSON on a concrete event", () => {
@@ -102,7 +106,16 @@ describe("metadata on events", () => {
 describe("metadata on messages", () => {
   // Developer, system, assistant and user derive from BaseMessageSchema; tool,
   // activity and reasoning are standalone schemas that declare it themselves.
-  const cases: Array<[string, { parse: (v: unknown) => { metadata?: unknown } }, object]> = [
+  const cases: Array<
+    [
+      string,
+      {
+        parse: (v: unknown) => { metadata?: unknown };
+        safeParse: (v: unknown) => { success: boolean };
+      },
+      object,
+    ]
+  > = [
     ["developer", DeveloperMessageSchema, { id: "1", role: "developer", content: "c" }],
     ["system", SystemMessageSchema, { id: "1", role: "system", content: "c" }],
     ["assistant", AssistantMessageSchema, { id: "1", role: "assistant", content: "c" }],
@@ -124,8 +137,8 @@ describe("metadata on messages", () => {
     expect(schema.parse(base).metadata).toBeUndefined();
   });
 
-  it.each(cases)("%s messages read a null metadata object as absent", (_role, schema, base) => {
-    expect(schema.parse({ ...base, metadata: null }).metadata).toBeUndefined();
+  it.each(cases)("%s messages reject a null metadata object", (_role, schema, base) => {
+    expect(schema.safeParse({ ...base, metadata: null }).success).toBe(false);
   });
 });
 
