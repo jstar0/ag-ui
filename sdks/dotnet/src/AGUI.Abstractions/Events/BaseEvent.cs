@@ -31,6 +31,14 @@ public abstract class BaseEvent
     public JsonElement? RawEvent { get; set; }
 
     /// <summary>
+    /// Gets or sets the identifier of the subagent run this event is
+    /// attributed to, when a subagent produced it on behalf of the main run.
+    /// </summary>
+    [JsonPropertyName("subagentRunId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SubagentRunId { get; set; }
+
+    /// <summary>
     /// Gets or sets extra information attached to this event, open by key.
     /// </summary>
     /// <remarks>
