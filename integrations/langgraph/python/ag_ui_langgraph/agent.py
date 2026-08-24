@@ -1666,16 +1666,20 @@ class LangGraphAgent:
                 graph_context = current_subgraph if current_subgraph else ROOT_SUBGRAPH_NAME
 
                 if is_subgraph_stream and current_subgraph != self.current_subgraph:
-                    self.current_subgraph = current_subgraph
                     # Every time a subgraph changes, we need to update the state and messages snapshots.
                     # Under hidden, a transition TRIGGERED by a subagent-side event
                     # snapshots a partial subgraph fragment that would replace the
                     # parent's state on the client — that provenance is only visible
-                    # here, where the triggering upstream event is in scope.
+                    # here, where the triggering upstream event is in scope. Skipping
+                    # DEFERS rather than swallows: current_subgraph stays unadvanced,
+                    # so the next parent-side event re-triggers the sync (round 4: a
+                    # declared subgraph's message otherwise appeared only in the
+                    # final snapshot).
                     if not (
                         self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
                         and self._raw_payload_is_subagent_side(self.active_run, event)
                     ):
+                        self.current_subgraph = current_subgraph
                         async for ev in self.get_state_and_messages_snapshots(config):
                             yield ev
 
@@ -1878,6 +1882,18 @@ class LangGraphAgent:
                     elif (
                         self.emit_subagent_events
                         and self.active_run.get("current_subagent_run_id")
+                    ) or (
+                        # Hidden: the same partial-fragment hazard, but the window
+                        # can be momentarily closed between fan-out lanes when the
+                        # exit event arrives — the triggering event's own namespace
+                        # is the reliable provenance (round 4: all six fan-out
+                        # reruns leaked one worker's partial state through this
+                        # producer while the transition helper was guarded).
+                        self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
+                        and (
+                            self.active_run.get("current_subagent_run_id")
+                            or self._raw_payload_is_subagent_side(self.active_run, event)
+                        )
                     ):
                         # Node-exit snapshots are suppressed while a subagent is
                         # active because a subgraph's state is a PARTIAL view of the
