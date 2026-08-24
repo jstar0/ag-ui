@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from ag_ui.core import (
     EventType,
+    RawEvent,
+    StateSnapshotEvent,
     StepStartedEvent,
     StepFinishedEvent,
     TextMessageStartEvent,
@@ -492,3 +494,96 @@ class TestHiddenIdReuseAndCollision(unittest.TestCase):
             type=EventType.TOOL_CALL_RESULT, message_id="tr1", tool_call_id="tc1",
             content="42",
         )))
+
+
+class TestHiddenBoundaryAndStateLeaks(unittest.TestCase):
+    """Review round 2, P1: DeepAgents' boundary chain events run under a bare
+    `tools:<uuid>` namespace (no `|`), which the window cannot see, and
+    mid-fan-out snapshots carry partial subgraph fragments that would REPLACE
+    the parent's state on the client."""
+
+    def _agent(self):
+        agent = _make_agent(subagent_visibility="hidden")
+        agent.active_run = {"current_subagent_run_id": None, "active_subagents": {}}
+        return agent
+
+    def test_a_boundary_raw_is_suppressed_before_any_lane_exists(self):
+        agent = self._agent()
+        boundary = RawEvent(type=EventType.RAW, event={
+            "event": "on_chain_start",
+            "name": "researcher",
+            "metadata": {
+                "langgraph_checkpoint_ns": "tools:3ed68888-899f-e671-0f12-5fcec1a7ff89",
+                "lc_agent_name": "researcher",
+            },
+        })
+        self.assertIsNone(agent._dispatch_event(boundary))
+
+    def test_a_parent_raw_stays_visible(self):
+        agent = self._agent()
+        parent = RawEvent(type=EventType.RAW, event={
+            "event": "on_chain_start",
+            "name": "model",
+            "metadata": {"langgraph_checkpoint_ns": "", "lc_agent_name": "main"},
+        })
+        self.assertIsNotNone(agent._dispatch_event(parent))
+
+    def test_a_known_boundary_segment_suppresses_nested_raws(self):
+        agent = self._agent()
+        agent.active_run["known_subagent_segments"] = {"tools:abc"}
+        nested = RawEvent(type=EventType.RAW, event={
+            "event": "on_chain_end",
+            "name": "researcher",
+            "metadata": {
+                "langgraph_checkpoint_ns": "tools:abc",
+                "lc_agent_name": None,
+            },
+        })
+        self.assertIsNone(agent._dispatch_event(nested))
+
+    def test_state_is_suppressed_while_any_delegation_is_in_flight(self):
+        agent = self._agent()
+        agent.active_run["active_subagents"] = {"tools:s1": {}, "tools:s2": {}}
+        # Mid-fan-out, the window can be None between lanes — the snapshot is a
+        # partial subgraph fragment either way.
+        snapshot = StateSnapshotEvent(
+            type=EventType.STATE_SNAPSHOT, snapshot={"leak": ["second"]},
+        )
+        self.assertIsNone(agent._dispatch_event(snapshot))
+        # Once every subagent closed, the parent's own state flows again.
+        agent.active_run["active_subagents"] = {}
+        self.assertIsNotNone(agent._dispatch_event(StateSnapshotEvent(
+            type=EventType.STATE_SNAPSHOT, snapshot={"parent": True},
+        )))
+
+
+class TestHiddenLaneScopedStreamMembership(unittest.TestCase):
+    """Review round 2, P2: streamed_tool_call_ids was keyed by bare public id.
+    Hidden mints no lane-specific ids, so a nested `task` call reusing the
+    parent's raw id collided: the inner completion discarded the parent's
+    membership, and the parent's completion re-emitted a full visible
+    Start/Args/End before its result."""
+
+    def test_hidden_keys_are_lane_scoped(self):
+        agent = _make_agent(subagent_visibility="hidden")
+        agent.active_run = {"current_subagent_run_id": None, "streamed_tool_call_ids": set()}
+        ids = agent.active_run["streamed_tool_call_ids"]
+        # Parent streams the task call at the root lane.
+        ids.add(agent._streamed_call_key("task-collide"))
+        # The inner lane's completion discards ITS key...
+        agent.active_run["current_subagent_run_id"] = "tools:inner"
+        ids.discard(agent._streamed_call_key("task-collide"))
+        # ...and the parent's membership survives, so its completion does not
+        # re-emit the call.
+        agent.active_run["current_subagent_run_id"] = None
+        self.assertIn(agent._streamed_call_key("task-collide"), ids)
+
+    def test_inline_and_attributed_keep_the_bare_key(self):
+        for kwargs in ({"subagent_visibility": "inline"}, {"subagent_visibility": "attributed"}):
+            agent = _make_agent(**kwargs)
+            agent.active_run = {"current_subagent_run_id": "tools:x"}
+            self.assertEqual(
+                agent._streamed_call_key("tc1"), "tc1",
+                "inline is byte-identical legacy; attributed's minting already "
+                "separates lanes — only hidden needs lane scoping",
+            )

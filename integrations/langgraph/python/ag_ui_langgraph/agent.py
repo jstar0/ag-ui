@@ -718,6 +718,23 @@ class LangGraphAgent:
                 f"keyword arguments: {exc}"
             ) from exc
 
+
+    def _streamed_call_key(self, public_call_id):
+        """Membership key for streamed_tool_call_ids.
+
+        Hidden runs without attributed mode's collision-minting registry, so a
+        nested `task` call reusing the parent's raw id collides on a bare-id
+        key: the inner completion discarded the parent's membership and the
+        parent's completion re-emitted a full visible Start/Args/End. Scoping
+        the key by lane keeps the two memberships apart. Inline and attributed
+        keep the bare public id — inline is byte-identical legacy (single
+        effective membership space, as before), attributed's minting already
+        makes public ids unique per lane.
+        """
+        if self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN:
+            return (self.active_run.get("current_subagent_run_id"), public_call_id)
+        return public_call_id
+
     def _dispatch_event(self, event: ProcessedEvents) -> ProcessedEvents:
         if event.type == EventType.RAW:
             event.event = make_json_safe(event.event)
@@ -884,12 +901,52 @@ class LangGraphAgent:
                 return True
             return in_window
 
+        # State and RAW leak through gaps the window cannot see: mid-fan-out
+        # snapshots carry partial subgraph fragments that would REPLACE the
+        # parent's state on the client, and DeepAgents' boundary chain events
+        # arrive under a bare `tools:<uuid>` namespace (no `|`) before any lane
+        # exists. Both are subagent internals under hidden's contract, so they
+        # are suppressed while a delegation is in flight at all — the parent's
+        # own state resumes flowing once every subagent closed.
+        if etype in (EventType.STATE_SNAPSHOT, EventType.STATE_DELTA):
+            return in_window or bool(active_run.get("active_subagents"))
+        if etype == EventType.RAW:
+            if in_window or bool(active_run.get("active_subagents")):
+                return True
+            return self._raw_payload_is_subagent_side(active_run, getattr(event, "event", None))
+
         # Windowless pairing does not apply to the rest of the attributable
-        # surface (state/activity/custom/raw): those are point events, dropped
-        # purely by window membership.
+        # surface (activity/custom): those are point events, dropped purely by
+        # window membership.
         if etype in _SUBAGENT_ATTRIBUTABLE_EVENT_TYPES:
             return in_window
         return False
+
+    def _raw_payload_is_subagent_side(self, active_run, payload) -> bool:
+        """Whether a RAW event's upstream payload originates inside a subagent.
+
+        Mirrors derive_subagent_context's fallback but WITHOUT the nested-`|`
+        requirement: the delegation's boundary chain events (the `task`
+        ToolNode entering/leaving) run under `tools:<uuid>` alone, with the
+        subagent's lc_agent_name — visible-parent events never look like that.
+        """
+        if not isinstance(payload, dict):
+            return False
+        metadata = payload.get("metadata") or {}
+        ns = metadata.get("langgraph_checkpoint_ns") or ""
+        if not ns:
+            return False
+        segments = ns.split("|")
+        known = active_run.get("known_subagent_segments") or set()
+        if any(segment in known for segment in segments):
+            return True
+        leading = segments[0]
+        root_name = leading.split(":")[0]
+        return (
+            ":" in leading
+            and root_name not in self.subgraphs
+            and bool(metadata.get("lc_agent_name"))
+        )
 
     def _capture_task_tool_dispatch(self, event: dict) -> None:
         """Map each `task` ToolNode dispatch to its originating tool_call_id.
@@ -3174,7 +3231,7 @@ class LangGraphAgent:
                 # id: the raw id can be shared across lanes, and one lane's
                 # result discarding a shared raw key made the other lane's
                 # result spuriously re-emit its whole call.
-                self.active_run["streamed_tool_call_ids"].add(public_call_id)
+                self.active_run["streamed_tool_call_ids"].add(self._streamed_call_key(public_call_id))
                 if should_emit_tool_calls:
                     yield self._dispatch_event(
                         ToolCallStartEvent(
@@ -3373,7 +3430,7 @@ class LangGraphAgent:
                     # public id its START carried (or the raw id when this call
                     # was never streamed and is being emitted here first).
                     public_call_id = self._resolve_public_tool_call_id(tool_msg.tool_call_id)
-                    already_streamed = public_call_id in self.active_run["streamed_tool_call_ids"]
+                    already_streamed = self._streamed_call_key(public_call_id) in self.active_run["streamed_tool_call_ids"]
                     if not already_streamed:
                         yield self._dispatch_event(
                             ToolCallStartEvent(
@@ -3401,7 +3458,7 @@ class LangGraphAgent:
                                 raw_event=event
                             )
                         )
-                    self.active_run["streamed_tool_call_ids"].discard(public_call_id)
+                    self.active_run["streamed_tool_call_ids"].discard(self._streamed_call_key(public_call_id))
 
                     yield self._dispatch_event(
                         ToolCallResultEvent(
@@ -3436,7 +3493,7 @@ class LangGraphAgent:
             # id its START carried (or the raw id when this call was never
             # streamed and is being emitted here first).
             public_call_id = self._resolve_public_tool_call_id(tool_call_output.tool_call_id)
-            already_streamed = public_call_id in self.active_run["streamed_tool_call_ids"]
+            already_streamed = self._streamed_call_key(public_call_id) in self.active_run["streamed_tool_call_ids"]
             if not already_streamed:
                 yield self._dispatch_event(
                     ToolCallStartEvent(
@@ -3464,7 +3521,7 @@ class LangGraphAgent:
                         raw_event=event
                     )
                 )
-            self.active_run["streamed_tool_call_ids"].discard(public_call_id)
+            self.active_run["streamed_tool_call_ids"].discard(self._streamed_call_key(public_call_id))
 
             yield self._dispatch_event(
                 ToolCallResultEvent(
