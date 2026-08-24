@@ -1665,6 +1665,22 @@ class LangGraphAgent:
 
                 graph_context = current_subgraph if current_subgraph else ROOT_SUBGRAPH_NAME
 
+                # Flush a deferred sync FIRST: the skip below records the debt,
+                # and any later parent-side event pays it — round 5 showed real
+                # parent-root events (empty or `parent:<uuid>` namespaces) never
+                # satisfy is_subgraph_stream, so leaving current_subgraph
+                # unadvanced alone never retried and the declared subgraph's
+                # snapshot stayed missing until run end.
+                deferred_sync = self.active_run.get("deferred_subgraph_sync")
+                if (
+                    deferred_sync is not None
+                    and not self._raw_payload_is_subagent_side(self.active_run, event)
+                ):
+                    self.active_run["deferred_subgraph_sync"] = None
+                    self.current_subgraph = deferred_sync
+                    async for ev in self.get_state_and_messages_snapshots(config):
+                        yield ev
+
                 if is_subgraph_stream and current_subgraph != self.current_subgraph:
                     # Every time a subgraph changes, we need to update the state and messages snapshots.
                     # Under hidden, a transition TRIGGERED by a subagent-side event
@@ -1679,9 +1695,14 @@ class LangGraphAgent:
                         self.subagent_visibility == SUBAGENT_VISIBILITY_HIDDEN
                         and self._raw_payload_is_subagent_side(self.active_run, event)
                     ):
+                        self.active_run["deferred_subgraph_sync"] = None
                         self.current_subgraph = current_subgraph
                         async for ev in self.get_state_and_messages_snapshots(config):
                             yield ev
+                    else:
+                        # Record the debt for the flush above — the next
+                        # parent-side event of ANY shape pays it.
+                        self.active_run["deferred_subgraph_sync"] = current_subgraph
 
                 # Record each `task` ToolNode dispatch (its on_chain_start
                 # precedes the task's on_tool_start) so the subagent can be
