@@ -1,13 +1,6 @@
 import { AbstractAgent } from "../agent";
 import { AgentSubscriber } from "../subscriber";
-import {
-  BaseEvent,
-  Message,
-  RunAgentInput,
-  State,
-  ToolCall,
-  AssistantMessage,
-} from "@ag-ui/core";
+import { BaseEvent, Message, RunAgentInput, State, ToolCall, AssistantMessage } from "@ag-ui/core";
 import { Observable, of } from "rxjs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
